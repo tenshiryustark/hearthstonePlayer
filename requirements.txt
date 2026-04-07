@@ -1,0 +1,8 @@
+# Core dependencies for the Hearthstone automated player agent
+# Screen capture & image processing (required for live play)
+mss>=9.0.1
+Pillow>=10.0.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
