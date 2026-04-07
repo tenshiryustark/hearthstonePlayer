@@ -5,6 +5,18 @@ It uses ``mss`` for fast multi-platform screenshot capture and ``Pillow``
 for image processing.  Actual card/UI recognition (OCR, template matching,
 or a neural model) is plugged in via the ``_detect_*`` helper stubs.
 
+Window-aware capture (1920 × 1080 windowed mode)
+-------------------------------------------------
+The reader first tries to locate the Hearthstone window via
+:mod:`src.window_finder`.  When found, it captures only the game window
+region so that all region coordinates are relative to the game content
+rather than the full desktop.  This is essential for windowed mode where
+the game window does not fill the entire screen.
+
+If the Hearthstone window cannot be found, :meth:`read_game_state` returns
+a :class:`GameState` with ``game_active=False`` immediately, and the agent
+loop waits before retrying.
+
 Replacing the stubs
 -------------------
 Override :class:`ScreenReader` and fill in the ``_detect_*`` methods, or
@@ -16,7 +28,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
+
+from .window_finder import find_hearthstone_window
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +52,10 @@ except ImportError:  # pragma: no cover
 @dataclass
 class GameState:
     """Snapshot of the Hearthstone game as read from the screen."""
+
+    # True only when a match is currently in progress (board is visible).
+    # When False the agent should wait instead of trying to act.
+    game_active: bool = False
 
     # Cards currently in the player's hand (list of raw dicts so they can be
     # instantiated as :class:`~src.card.Card` objects by the agent).
@@ -62,7 +80,11 @@ class GameState:
 
 
 # ---------------------------------------------------------------------------
-# Screen region definitions (fractions of screen width/height)
+# Screen region definitions (fractions of the *game window* width/height)
+#
+# These fractions are calibrated against a 1920 × 1080 Hearthstone window.
+# Because the reader crops to the game window first, they remain valid even
+# when the desktop resolution differs from 1920 × 1080.
 # ---------------------------------------------------------------------------
 
 REGIONS = {
@@ -94,6 +116,29 @@ REGIONS = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# In-game pixel probe
+#
+# To distinguish "in a match" from "main menu / deck selection", we sample a
+# single reference pixel inside the game window.  During an active match the
+# board is always visible; outside a match the screen shows the main menu or
+# other UI overlays.
+#
+# The coordinates below are expressed as fractions of the game window and
+# point to the center of the board area.  The expected color range
+# (approximate green of the Hearthstone board texture at 1920 × 1080) is
+# used as a heuristic.  Adjust BOARD_PIXEL_TOLERANCE for robustness.
+# ---------------------------------------------------------------------------
+
+# Fractional position of the board-center probe pixel (relative to game window)
+BOARD_PROBE_X_F: float = 0.50   # horizontal center
+BOARD_PROBE_Y_F: float = 0.50   # vertical center
+
+# The board background has a greenish hue.  We check that the green channel
+# is dominant and the pixel is not close to black (menu background).
+BOARD_MIN_GREEN: int = 60    # minimum green channel value during a match
+BOARD_MIN_BRIGHTNESS: int = 40  # minimum mean channel value (not black)
+
 
 # ---------------------------------------------------------------------------
 # ScreenReader
@@ -101,7 +146,12 @@ REGIONS = {
 
 
 class ScreenReader:
-    """Reads the Hearthstone game state from the primary monitor.
+    """Reads the Hearthstone game state from the game window.
+
+    The reader locates the Hearthstone window each frame via
+    :func:`~src.window_finder.find_hearthstone_window` and captures only
+    that region, so region coordinates are always relative to the game
+    content regardless of where the window sits on the desktop.
 
     Parameters
     ----------
@@ -110,7 +160,8 @@ class ScreenReader:
         cards in a cropped screen region.  When not provided the built-in
         stub is used (returns an empty list).
     monitor_index:
-        Index of the monitor to capture (1-based, ``1`` = primary).
+        Fallback monitor index (1-based, ``1`` = primary) used when the
+        Hearthstone window cannot be located by title.
     """
 
     def __init__(
@@ -130,19 +181,50 @@ class ScreenReader:
     # Public API                                                           #
     # ------------------------------------------------------------------ #
 
-    def capture_screen(self) -> "Image.Image":
-        """Return a full-screen PIL Image of the primary monitor."""
+    def capture_game_window(self) -> Tuple[Optional["Image.Image"], bool]:
+        """Capture the Hearthstone game window and return ``(image, found)``.
+
+        * If the window is found its content is returned and ``found=True``.
+        * If the window cannot be located, falls back to the full monitor and
+          returns ``found=False`` so the caller can mark the state as inactive.
+        """
+        bbox = find_hearthstone_window()
         with mss.mss() as sct:
+            if bbox is not None:
+                left, top, width, height = bbox
+                region = {
+                    "left": left,
+                    "top": top,
+                    "width": width,
+                    "height": height,
+                }
+                screenshot = sct.grab(region)
+                image = Image.frombytes(
+                    "RGB", screenshot.size, screenshot.bgra, "raw", "BGRX"
+                )
+                return image, True
+
+            # Fallback: full monitor capture
             monitor = sct.monitors[self._monitor_index]
             screenshot = sct.grab(monitor)
-            return Image.frombytes(
+            image = Image.frombytes(
                 "RGB", screenshot.size, screenshot.bgra, "raw", "BGRX"
             )
+            return image, False
+
+    def capture_screen(self) -> "Image.Image":
+        """Return a PIL Image of the Hearthstone window (or full monitor).
+
+        Deprecated alias kept for backwards compatibility; prefer
+        :meth:`capture_game_window`.
+        """
+        image, _ = self.capture_game_window()
+        return image  # type: ignore[return-value]
 
     def crop_region(
         self, screen: "Image.Image", region_name: str
     ) -> "Image.Image":
-        """Crop a named region from *screen*."""
+        """Crop a named region from *screen* (which must be the game window)."""
         reg = REGIONS[region_name]
         w, h = screen.size
         left = int(reg["left_f"] * w)
@@ -152,13 +234,24 @@ class ScreenReader:
         return screen.crop((left, top, right, bottom))
 
     def read_game_state(self) -> GameState:
-        """Capture the screen and return the current :class:`GameState`.
+        """Capture the game window and return the current :class:`GameState`.
 
-        This is the main entry point for the agent loop.
+        Returns a :class:`GameState` with ``game_active=False`` immediately
+        when the Hearthstone window cannot be found, so the agent loop can
+        wait without performing any actions.
         """
-        screen = self.capture_screen()
+        screen, window_found = self.capture_game_window()
         state = GameState()
 
+        if not window_found:
+            logger.debug("Hearthstone window not found.")
+            return state  # game_active stays False
+
+        if not self._detect_game_active(screen):
+            logger.debug("Hearthstone window found but game board not detected.")
+            return state  # game_active stays False
+
+        state.game_active = True
         state.available_mana = self._read_mana(screen)
         state.my_hero_health = self._read_hero_health(screen, enemy=False)
         state.enemy_hero_health = self._read_hero_health(screen, enemy=True)
@@ -180,6 +273,39 @@ class ScreenReader:
     # ------------------------------------------------------------------ #
     # Detection stubs – replace with real implementations                 #
     # ------------------------------------------------------------------ #
+
+    def _detect_game_active(self, screen: "Image.Image") -> bool:
+        """Determine whether an active match is currently on screen.
+
+        The default implementation samples a single pixel at the centre of
+        the board area and checks for the green-dominant board texture that
+        is present throughout a Hearthstone match.  It will not fire on the
+        main menu, deck selection, or between-game screens.
+
+        Override this method (or subclass :class:`ScreenReader`) to use a
+        more precise detection method such as template matching against the
+        end-turn button or the mana crystal bar.
+
+        Parameters
+        ----------
+        screen:
+            A PIL Image already cropped to the game window.
+        """
+        w, h = screen.size
+        px = int(BOARD_PROBE_X_F * w)
+        py = int(BOARD_PROBE_Y_F * h)
+        try:
+            r, g, b = screen.getpixel((px, py))
+        except Exception:
+            return False
+
+        brightness = (r + g + b) / 3
+        green_dominant = g > r and g > b
+        return (
+            brightness >= BOARD_MIN_BRIGHTNESS
+            and g >= BOARD_MIN_GREEN
+            and green_dominant
+        )
 
     def _read_mana(self, screen: "Image.Image") -> int:
         """Extract current mana from *screen*.

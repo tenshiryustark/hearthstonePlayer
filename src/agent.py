@@ -147,23 +147,43 @@ class HearthstoneAgent:
     def run(self) -> None:
         """Start the main agent loop.
 
-        The loop reads the screen every ``poll_interval`` seconds, executes
-        the current turn when it is the player's turn, and handles game-end
-        events.  Ctrl-C exits cleanly.
+        The loop reads the game window every ``poll_interval`` seconds.
+
+        * When the Hearthstone window is not found or the game board is not
+          visible, the agent logs a single "waiting" message and keeps
+          polling without performing any game actions.
+        * When an active match is detected, the agent plans and executes
+          the turn.
+        * When a game-over screen is detected, card values are updated and
+          the agent resets for the next match.
+
+        Press Ctrl-C to exit cleanly.
         """
         logger.info("Hearthstone agent started.  Waiting for a game…")
+        _was_waiting = False
         try:
             while True:
                 try:
                     state = self.screen_reader.read_game_state()
 
-                    if state.game_over:
-                        if state.player_won is not None:
-                            self.on_game_end(state.player_won)
-                        else:
-                            logger.info("Game over – outcome unclear, skipping update.")
+                    if not state.game_active:
+                        if not _was_waiting:
+                            logger.info(
+                                "Hearthstone game board not detected – "
+                                "waiting for a match to start…"
+                            )
+                            _was_waiting = True
                     else:
-                        self.execute_turn(state)
+                        _was_waiting = False
+                        if state.game_over:
+                            if state.player_won is not None:
+                                self.on_game_end(state.player_won)
+                            else:
+                                logger.info(
+                                    "Game over – outcome unclear, skipping update."
+                                )
+                        else:
+                            self.execute_turn(state)
 
                 except Exception as exc:  # pylint: disable=broad-except
                     logger.error("Error during agent loop: %s", exc, exc_info=True)

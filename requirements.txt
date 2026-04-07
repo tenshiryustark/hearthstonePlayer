@@ -3,6 +3,10 @@
 mss>=9.0.1
 Pillow>=10.0.0
 
+# Window detection – finds the Hearthstone window in windowed mode
+# (Windows: also ships win32gui via pywin32; Linux: needs xdotool system package)
+pygetwindow>=0.0.9
+
 # Testing
 pytest>=7.4.0
 pytest-cov>=4.1.0

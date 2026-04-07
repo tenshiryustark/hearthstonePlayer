@@ -79,6 +79,7 @@ class TestOnGameEnd:
 class TestExecuteTurn:
     def test_played_cards_tracked(self, agent):
         state = GameState(
+            game_active=True,
             hand_cards=[make_card_dict("c1", "Wisp", 0, 1, 1)],
             board_minions=[],
             enemy_minions=[],
@@ -88,5 +89,5 @@ class TestExecuteTurn:
         assert "c1" in agent._played_this_game
 
     def test_no_crash_with_empty_state(self, agent):
-        state = GameState()
+        state = GameState(game_active=True)
         agent.execute_turn(state)  # should not raise
