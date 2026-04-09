@@ -3,8 +3,15 @@
 Supported platforms
 -------------------
 * **Windows** – tries ``pygetwindow`` first, then ``win32gui`` as a fallback.
-* **Linux**   – uses ``xdotool`` (must be installed: ``apt install xdotool``).
+* **Linux**   – uses ``python-xlib`` (pure Python, pip-installable; no system
+  package required).  Falls back to ``xdotool`` when python-xlib is absent.
 * **macOS**   – uses the ``Quartz`` framework (available on macOS by default).
+
+Title matching
+--------------
+All platform backends perform a **case-insensitive substring match** against
+:data:`HEARTHSTONE_WINDOW_TITLE`.  This means window titles such as
+``"Hearthstone - Loading"`` or ``"HEARTHSTONE"`` are recognised correctly.
 
 The main public function is :func:`find_hearthstone_window`, which returns
 the window bounding box ``(left, top, width, height)`` in screen pixels, or
@@ -19,12 +26,19 @@ from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Exact window title used by Hearthstone on all platforms
+# Substring used for window title matching (case-insensitive).
+# Any window whose title contains this string (ignoring case) is considered
+# the Hearthstone window, so loading-screen variants are also matched.
 HEARTHSTONE_WINDOW_TITLE = "Hearthstone"
 
 # Default game resolution for windowed mode (used as fallback dimensions)
 DEFAULT_GAME_WIDTH = 1440
 DEFAULT_GAME_HEIGHT = 1080
+
+
+def _title_matches(title: str) -> bool:
+    """Return ``True`` when *title* contains :data:`HEARTHSTONE_WINDOW_TITLE`."""
+    return HEARTHSTONE_WINDOW_TITLE.lower() in (title or "").lower()
 
 
 def find_hearthstone_window() -> Optional[Tuple[int, int, int, int]]:
@@ -59,15 +73,14 @@ def _find_window_win32() -> Optional[Tuple[int, int, int, int]]:
     try:
         import pygetwindow as gw  # type: ignore
 
-        wins = gw.getWindowsWithTitle(HEARTHSTONE_WINDOW_TITLE)
-        if wins:
-            win = wins[0]
-            bbox = (win.left, win.top, win.width, win.height)
-            logger.debug(
-                "Window found via pygetwindow: left=%d top=%d width=%d height=%d",
-                *bbox,
-            )
-            return bbox
+        for win in gw.getAllWindows():
+            if _title_matches(win.title):
+                bbox = (win.left, win.top, win.width, win.height)
+                logger.debug(
+                    "Window found via pygetwindow: left=%d top=%d width=%d height=%d",
+                    *bbox,
+                )
+                return bbox
     except Exception as exc:
         logger.debug("pygetwindow lookup failed: %s", exc)
 
@@ -75,9 +88,16 @@ def _find_window_win32() -> Optional[Tuple[int, int, int, int]]:
     try:
         import win32gui  # type: ignore
 
-        hwnd = win32gui.FindWindow(None, HEARTHSTONE_WINDOW_TITLE)
-        if hwnd:
-            rect = win32gui.GetWindowRect(hwnd)
+        found: list = []
+
+        def _cb(hwnd: int, _: object) -> None:
+            title = win32gui.GetWindowText(hwnd)
+            if _title_matches(title):
+                found.append(hwnd)
+
+        win32gui.EnumWindows(_cb, None)
+        if found:
+            rect = win32gui.GetWindowRect(found[0])
             left, top, right, bottom = rect
             bbox = (left, top, right - left, bottom - top)
             logger.debug(
@@ -92,7 +112,61 @@ def _find_window_win32() -> Optional[Tuple[int, int, int, int]]:
 
 
 def _find_window_linux() -> Optional[Tuple[int, int, int, int]]:
-    """Locate the window on Linux using xdotool."""
+    """Locate the window on Linux using python-xlib (falls back to xdotool)."""
+    # Primary: python-xlib – pure Python, pip-installable
+    try:
+        from Xlib import display as xdisplay  # type: ignore
+        from Xlib import X  # type: ignore
+        from Xlib import error as xerror  # type: ignore
+
+        dpy = xdisplay.Display()
+        root = dpy.screen().root
+
+        def _search(window) -> Optional[Tuple[int, int, int, int]]:
+            try:
+                name = window.get_wm_name() or ""
+            except xerror.XError:
+                name = ""
+            if _title_matches(name):
+                try:
+                    geo = window.get_geometry()
+                    # Translate coordinates to root (absolute screen position)
+                    translated = root.translate_coords(window, 0, 0)
+                    bbox = (translated.x, translated.y, geo.width, geo.height)
+                    logger.debug(
+                        "Window found via python-xlib: left=%d top=%d "
+                        "width=%d height=%d",
+                        *bbox,
+                    )
+                    return bbox
+                except xerror.XError:
+                    pass
+
+            try:
+                children = window.query_tree().children
+            except xerror.XError:
+                children = []
+            for child in children:
+                result = _search(child)
+                if result is not None:
+                    return result
+            return None
+
+        result = _search(root)
+        dpy.close()
+        if result is not None:
+            return result
+    except ImportError:
+        logger.debug("python-xlib not available – falling back to xdotool")
+    except Exception as exc:
+        logger.debug("python-xlib lookup failed: %s", exc)
+
+    # Fallback: xdotool subprocess
+    return _find_window_linux_xdotool()
+
+
+def _find_window_linux_xdotool() -> Optional[Tuple[int, int, int, int]]:
+    """Locate the window on Linux using the xdotool command-line tool."""
     try:
         search = subprocess.run(
             ["xdotool", "search", "--name", HEARTHSTONE_WINDOW_TITLE],
@@ -144,7 +218,7 @@ def _find_window_macos() -> Optional[Tuple[int, int, int, int]]:
             Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID
         )
         for win in window_list:
-            if HEARTHSTONE_WINDOW_TITLE in (win.get("kCGWindowName") or ""):
+            if _title_matches(win.get("kCGWindowName") or ""):
                 bounds = win["kCGWindowBounds"]
                 bbox = (
                     int(bounds["X"]),

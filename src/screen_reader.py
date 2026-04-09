@@ -1,9 +1,34 @@
 """Screen reader – captures the Hearthstone game window and extracts state.
 
 This module provides a framework for reading the game state from the screen.
-It uses ``mss`` for fast multi-platform screenshot capture and ``Pillow``
-for image processing.  Actual card/UI recognition (OCR, template matching,
-or a neural model) is plugged in via the ``_detect_*`` helper stubs.
+
+Capture backends
+----------------
+The reader tries the following backends in order and uses the first that is
+available:
+
+1. **pyautogui** – DPI-aware, cross-platform, pure-pip (no system packages).
+   Installed via ``pip install pyautogui``.
+2. **mss** – fast multi-platform screenshot library (original backend, kept
+   as fallback).  Installed via ``pip install mss``.
+
+Board detection
+---------------
+The reader offers two strategies for deciding whether a Hearthstone match is
+currently on screen, tried in order:
+
+1. **OpenCV template matching** (preferred) – matches a small reference image
+   of the End Turn button (``src/assets/end_turn_button.png``) against the
+   captured game window using ``cv2.matchTemplate`` with the
+   ``TM_CCOEFF_NORMED`` metric.  A match is declared when the peak
+   normalised correlation coefficient exceeds
+   :data:`TEMPLATE_MATCH_THRESHOLD` (default 0.75).  This method is
+   theme-agnostic, resolution-robust, and unaffected by HUD or loading
+   screens.
+2. **Brightness probe** (fallback) – samples :data:`BOARD_PROBE_POINTS`
+   across the board area and checks mean brightness against
+   :data:`BOARD_MIN_MEAN_BRIGHTNESS`.  Used automatically when OpenCV is
+   not installed or the template file is missing.
 
 Window-aware capture (1440 × 1080 windowed mode)
 -------------------------------------------------
@@ -17,14 +42,6 @@ If the Hearthstone window cannot be found, :meth:`read_game_state` returns
 a :class:`GameState` with ``game_active=False`` immediately, and the agent
 loop waits before retrying.
 
-Active-match detection
-----------------------
-Once the window is captured, :meth:`ScreenReader._detect_game_active` checks
-whether the board is visible by sampling several probe pixels across both
-halves of the board and measuring their average brightness.  This check is
-board-theme agnostic — it does not require a specific color — so it works
-with all Hearthstone board themes (Stormwind, Witchwood, Naxxramas, etc.).
-
 Replacing the stubs
 -------------------
 Override :class:`ScreenReader` and fill in the ``_detect_*`` methods, or
@@ -35,6 +52,7 @@ a list of card dicts (``card_id``, ``name``, ``mana_cost``, ``attack``,
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple
 
@@ -42,14 +60,49 @@ from .window_finder import find_hearthstone_window
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Optional dependency flags
+# ---------------------------------------------------------------------------
+
+try:
+    import pyautogui  # type: ignore
+
+    _PYAUTOGUI_AVAILABLE = True
+except Exception:  # pragma: no cover – ImportError or KeyError('DISPLAY') on headless
+    _PYAUTOGUI_AVAILABLE = False
+
 try:
     import mss  # type: ignore
     import mss.tools  # type: ignore
+
+    _MSS_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _MSS_AVAILABLE = False
+
+try:
     from PIL import Image  # type: ignore
 
-    _CAPTURE_AVAILABLE = True
+    _PIL_AVAILABLE = True
 except ImportError:  # pragma: no cover
-    _CAPTURE_AVAILABLE = False
+    _PIL_AVAILABLE = False
+
+try:
+    import cv2  # type: ignore
+    import numpy as np  # type: ignore
+
+    _CV2_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _CV2_AVAILABLE = False
+
+# At least one capture backend must be available.
+_CAPTURE_AVAILABLE = (_PYAUTOGUI_AVAILABLE or _MSS_AVAILABLE) and _PIL_AVAILABLE
+
+# ---------------------------------------------------------------------------
+# Template asset path
+# ---------------------------------------------------------------------------
+
+_ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")
+_END_TURN_TEMPLATE_PATH = os.path.join(_ASSETS_DIR, "end_turn_button.png")
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +207,16 @@ BOARD_PROBE_POINTS: list = [
 # always significantly brighter than the near-black main-menu background.
 BOARD_MIN_MEAN_BRIGHTNESS: int = 35
 
+# ---------------------------------------------------------------------------
+# OpenCV template-matching threshold
+#
+# Peak normalised cross-correlation coefficient (0–1) that the End Turn button
+# template must achieve for the screen to be considered an active match.
+# A value of 0.75 gives a good balance between false-positives and misses.
+# ---------------------------------------------------------------------------
+
+TEMPLATE_MATCH_THRESHOLD: float = 0.75
+
 
 # ---------------------------------------------------------------------------
 # ScreenReader
@@ -179,18 +242,25 @@ class ScreenReader:
         Hearthstone window cannot be located by title.
     """
 
+    # Class-level defaults so that objects created with __new__ (e.g. in
+    # tests) work without calling __init__.
+    _monitor_index: int = 1
+    _template_match_threshold: float = TEMPLATE_MATCH_THRESHOLD
+
     def __init__(
         self,
         card_detector: Optional[Callable] = None,
         monitor_index: int = 1,
+        template_match_threshold: float = TEMPLATE_MATCH_THRESHOLD,
     ) -> None:
         if not _CAPTURE_AVAILABLE:
             raise RuntimeError(
-                "mss and Pillow are required for screen capture. "
-                "Install dependencies with: pip install -r requirements.txt"
+                "A screen-capture backend (pyautogui or mss) and Pillow are "
+                "required.  Install dependencies with: pip install -r requirements.txt"
             )
         self._card_detector = card_detector or self._detect_cards_stub
         self._monitor_index = monitor_index
+        self._template_match_threshold = template_match_threshold
 
     # ------------------------------------------------------------------ #
     # Public API                                                           #
@@ -199,31 +269,58 @@ class ScreenReader:
     def capture_game_window(self) -> Tuple[Optional["Image.Image"], bool]:
         """Capture the Hearthstone game window and return ``(image, found)``.
 
+        Tries **pyautogui** first (DPI-aware, no system packages), then falls
+        back to **mss** when pyautogui is unavailable.
+
         * If the window is found its content is returned and ``found=True``.
         * If the window cannot be located, falls back to the full monitor and
           returns ``found=False`` so the caller can mark the state as inactive.
         """
         bbox = find_hearthstone_window()
+
+        if _PYAUTOGUI_AVAILABLE:
+            return self._capture_pyautogui(bbox)
+        return self._capture_mss(bbox)
+
+    def _capture_pyautogui(
+        self, bbox: Optional[Tuple[int, int, int, int]]
+    ) -> Tuple["Image.Image", bool]:
+        """Capture using pyautogui (DPI-aware, primary backend)."""
+        if bbox is not None:
+            left, top, width, height = bbox
+            logger.debug(
+                "Capturing game window via pyautogui: "
+                "left=%d top=%d width=%d height=%d",
+                left, top, width, height,
+            )
+            image = pyautogui.screenshot(region=(left, top, width, height))
+            return image, True
+
+        logger.debug(
+            "Hearthstone window not found – capturing full screen via pyautogui."
+        )
+        image = pyautogui.screenshot()
+        return image, False
+
+    def _capture_mss(
+        self, bbox: Optional[Tuple[int, int, int, int]]
+    ) -> Tuple["Image.Image", bool]:
+        """Capture using mss (fallback backend)."""
         with mss.mss() as sct:
             if bbox is not None:
                 left, top, width, height = bbox
                 logger.debug(
-                    "Capturing game window: left=%d top=%d width=%d height=%d",
+                    "Capturing game window via mss: "
+                    "left=%d top=%d width=%d height=%d",
                     left, top, width, height,
                 )
-                region = {
-                    "left": left,
-                    "top": top,
-                    "width": width,
-                    "height": height,
-                }
+                region = {"left": left, "top": top, "width": width, "height": height}
                 screenshot = sct.grab(region)
                 image = Image.frombytes(
                     "RGB", screenshot.size, screenshot.bgra, "raw", "BGRX"
                 )
                 return image, True
 
-            # Fallback: full monitor capture
             logger.debug(
                 "Hearthstone window not found – falling back to full monitor %d.",
                 self._monitor_index,
@@ -321,24 +418,70 @@ class ScreenReader:
     def _detect_game_active(self, screen: "Image.Image") -> bool:
         """Determine whether an active match is currently on screen.
 
-        Samples :data:`BOARD_PROBE_POINTS` — six positions spread across the
-        board area — and computes the mean per-channel brightness.  An active
-        match always has a lit board regardless of the board theme (Stormwind,
-        Witchwood, Naxxramas, …), while the main menu and lobby screens are
-        near-black at those positions.
+        **Strategy 1 – OpenCV template matching (preferred)**
+        Loads the End Turn button reference image from
+        ``src/assets/end_turn_button.png`` and searches for it in *screen*
+        using ``cv2.matchTemplate`` with the ``TM_CCOEFF_NORMED`` metric.
+        Returns ``True`` when the peak correlation coefficient reaches
+        :data:`TEMPLATE_MATCH_THRESHOLD`.  This method is board-theme
+        agnostic, DPI-robust, and unaffected by splash screens or the lobby
+        (neither of which shows the End Turn button).
 
-        The check is theme-agnostic: it does **not** require a specific color
-        (e.g. green).  Only overall brightness matters.
-
-        Override this method (or subclass :class:`ScreenReader`) to use a
-        more precise detection method such as template matching against the
-        end-turn button or the mana crystal bar.
+        **Strategy 2 – Brightness probe (fallback)**
+        Used when ``opencv-python`` is not installed or the template file is
+        missing.  Samples :data:`BOARD_PROBE_POINTS` across the board area
+        and returns ``True`` when mean per-channel brightness exceeds
+        :data:`BOARD_MIN_MEAN_BRIGHTNESS`.
 
         Parameters
         ----------
         screen:
             A PIL Image already cropped to the game window.
         """
+        if _CV2_AVAILABLE and os.path.isfile(_END_TURN_TEMPLATE_PATH):
+            return self._detect_game_active_template(screen)
+        return self._detect_game_active_brightness(screen)
+
+    def _detect_game_active_template(self, screen: "Image.Image") -> bool:
+        """Template-matching implementation of :meth:`_detect_game_active`."""
+        template_bgr = cv2.imread(_END_TURN_TEMPLATE_PATH)
+        if template_bgr is None:
+            logger.debug(
+                "_detect_game_active: could not load template %s – "
+                "falling back to brightness probe.",
+                _END_TURN_TEMPLATE_PATH,
+            )
+            return self._detect_game_active_brightness(screen)
+
+        screen_np = np.array(screen)
+        screen_bgr = cv2.cvtColor(screen_np, cv2.COLOR_RGB2BGR)
+
+        # Scale the template down proportionally when it is larger than the
+        # game window (shouldn't happen in practice, but guards against it).
+        th, tw = template_bgr.shape[:2]
+        sh, sw = screen_bgr.shape[:2]
+        if tw > sw or th > sh:
+            scale = min(sw / tw, sh / th) * 0.9
+            template_bgr = cv2.resize(
+                template_bgr,
+                (max(1, int(tw * scale)), max(1, int(th * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        result = cv2.matchTemplate(screen_bgr, template_bgr, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, _ = cv2.minMaxLoc(result)
+        active = bool(max_val >= self._template_match_threshold)
+        logger.debug(
+            "_detect_game_active (template): confidence=%.3f  threshold=%.2f  "
+            "active=%s",
+            max_val,
+            self._template_match_threshold,
+            active,
+        )
+        return active
+
+    def _detect_game_active_brightness(self, screen: "Image.Image") -> bool:
+        """Brightness-probe fallback for :meth:`_detect_game_active`."""
         w, h = screen.size
         total_brightness: float = 0.0
         n = len(BOARD_PROBE_POINTS)
@@ -356,13 +499,15 @@ class ScreenReader:
             logger.debug("_detect_game_active: no probe points could be sampled.")
             return False
         mean_brightness = total_brightness / n
+        active = mean_brightness >= BOARD_MIN_MEAN_BRIGHTNESS
         logger.debug(
-            "_detect_game_active: mean_brightness=%.1f  threshold=%d  active=%s",
+            "_detect_game_active (brightness): mean_brightness=%.1f  "
+            "threshold=%d  active=%s",
             mean_brightness,
             BOARD_MIN_MEAN_BRIGHTNESS,
-            mean_brightness >= BOARD_MIN_MEAN_BRIGHTNESS,
+            active,
         )
-        return mean_brightness >= BOARD_MIN_MEAN_BRIGHTNESS
+        return active
 
     def _read_mana(self, screen: "Image.Image") -> int:
         """Extract current mana from *screen*.
