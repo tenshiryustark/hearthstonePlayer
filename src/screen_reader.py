@@ -17,6 +17,14 @@ If the Hearthstone window cannot be found, :meth:`read_game_state` returns
 a :class:`GameState` with ``game_active=False`` immediately, and the agent
 loop waits before retrying.
 
+Active-match detection
+----------------------
+Once the window is captured, :meth:`ScreenReader._detect_game_active` checks
+whether the board is visible by sampling several probe pixels across both
+halves of the board and measuring their average brightness.  This check is
+board-theme agnostic — it does not require a specific color — so it works
+with all Hearthstone board themes (Stormwind, Witchwood, Naxxramas, etc.).
+
 Replacing the stubs
 -------------------
 Override :class:`ScreenReader` and fill in the ``_detect_*`` methods, or
@@ -119,25 +127,32 @@ REGIONS = {
 # ---------------------------------------------------------------------------
 # In-game pixel probe
 #
-# To distinguish "in a match" from "main menu / deck selection", we sample a
-# single reference pixel inside the game window.  During an active match the
-# board is always visible; outside a match the screen shows the main menu or
-# other UI overlays.
+# To distinguish "in a match" from "main menu / deck selection", we sample
+# several pixels spread across the board area.  During an active match the
+# board is always lit regardless of the board theme (Stormwind, Witchwood,
+# Naxxramas, …).  The main-menu background is near-black at these positions.
 #
-# The coordinates below are expressed as fractions of the game window and
-# point to the center of the board area.  The expected color range
-# (approximate green of the Hearthstone board texture at 1920 × 1080) is
-# used as a heuristic.  Adjust BOARD_PIXEL_TOLERANCE for robustness.
+# All coordinates are fractions of the *game window* size.  The six probe
+# points are placed in the enemy-board half and the player-board half,
+# avoiding the horizontal center where UI elements (End Turn button, hero
+# power) may occlude the board texture.
 # ---------------------------------------------------------------------------
 
-# Fractional position of the board-center probe pixel (relative to game window)
-BOARD_PROBE_X_F: float = 0.50   # horizontal center
-BOARD_PROBE_Y_F: float = 0.50   # vertical center
+# Six (x_fraction, y_fraction) probe positions that cover the board area
+# while avoiding central UI elements.
+BOARD_PROBE_POINTS: list = [
+    (0.20, 0.35),  # enemy board – left
+    (0.50, 0.30),  # enemy board – center-top (above hero power)
+    (0.80, 0.35),  # enemy board – right
+    (0.20, 0.65),  # player board – left
+    (0.50, 0.60),  # player board – center-top (above hand area)
+    (0.80, 0.65),  # player board – right
+]
 
-# The board background has a greenish hue.  We check that the green channel
-# is dominant and the pixel is not close to black (menu background).
-BOARD_MIN_GREEN: int = 60    # minimum green channel value during a match
-BOARD_MIN_BRIGHTNESS: int = 40  # minimum mean channel value (not black)
+# Mean per-channel brightness (0–255) that must be reached across all probe
+# points for the screen to be considered an active match.  The game board is
+# always significantly brighter than the near-black main-menu background.
+BOARD_MIN_MEAN_BRIGHTNESS: int = 35
 
 
 # ---------------------------------------------------------------------------
@@ -277,10 +292,14 @@ class ScreenReader:
     def _detect_game_active(self, screen: "Image.Image") -> bool:
         """Determine whether an active match is currently on screen.
 
-        The default implementation samples a single pixel at the centre of
-        the board area and checks for the green-dominant board texture that
-        is present throughout a Hearthstone match.  It will not fire on the
-        main menu, deck selection, or between-game screens.
+        Samples :data:`BOARD_PROBE_POINTS` — six positions spread across the
+        board area — and computes the mean per-channel brightness.  An active
+        match always has a lit board regardless of the board theme (Stormwind,
+        Witchwood, Naxxramas, …), while the main menu and lobby screens are
+        near-black at those positions.
+
+        The check is theme-agnostic: it does **not** require a specific color
+        (e.g. green).  Only overall brightness matters.
 
         Override this method (or subclass :class:`ScreenReader`) to use a
         more precise detection method such as template matching against the
@@ -292,20 +311,22 @@ class ScreenReader:
             A PIL Image already cropped to the game window.
         """
         w, h = screen.size
-        px = int(BOARD_PROBE_X_F * w)
-        py = int(BOARD_PROBE_Y_F * h)
-        try:
-            r, g, b = screen.getpixel((px, py))
-        except Exception:
-            return False
+        total_brightness: float = 0.0
+        n = len(BOARD_PROBE_POINTS)
+        for x_f, y_f in BOARD_PROBE_POINTS:
+            px = int(x_f * w)
+            py = int(y_f * h)
+            try:
+                r, g, b = screen.getpixel((px, py))
+            except Exception:
+                n -= 1
+                continue
+            total_brightness += (r + g + b) / 3
 
-        brightness = (r + g + b) / 3
-        green_dominant = g > r and g > b
-        return (
-            brightness >= BOARD_MIN_BRIGHTNESS
-            and g >= BOARD_MIN_GREEN
-            and green_dominant
-        )
+        if n == 0:
+            return False
+        mean_brightness = total_brightness / n
+        return mean_brightness >= BOARD_MIN_MEAN_BRIGHTNESS
 
     def _read_mana(self, screen: "Image.Image") -> int:
         """Extract current mana from *screen*.

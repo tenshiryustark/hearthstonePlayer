@@ -5,10 +5,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.screen_reader import (
-    BOARD_MIN_BRIGHTNESS,
-    BOARD_MIN_GREEN,
-    BOARD_PROBE_X_F,
-    BOARD_PROBE_Y_F,
+    BOARD_MIN_MEAN_BRIGHTNESS,
+    BOARD_PROBE_POINTS,
     GameState,
     ScreenReader,
 )
@@ -58,24 +56,40 @@ class TestDetectGameActive:
     def teardown_method(self):
         self._mss_patch.stop()
 
-    def test_board_colour_returns_true(self):
-        # Approximate board green: R=70, G=110, B=65
+    def test_green_board_returns_true(self):
+        # Classic green Hearthstone board (e.g. default board)
         img = _make_image(70, 110, 65)
         assert self.reader._detect_game_active(img) is True
 
+    def test_brown_board_returns_true(self):
+        # Stormwind board – warm brown stone tones
+        img = _make_image(120, 90, 60)
+        assert self.reader._detect_game_active(img) is True
+
+    def test_purple_board_returns_true(self):
+        # Witchwood / Darkmoon Faire board – cold purple/grey tones
+        img = _make_image(80, 70, 110)
+        assert self.reader._detect_game_active(img) is True
+
+    def test_red_board_returns_true(self):
+        # Naxxramas / fiery board – red dominant
+        img = _make_image(110, 60, 55)
+        assert self.reader._detect_game_active(img) is True
+
     def test_main_menu_dark_returns_false(self):
-        # Dark/near-black background typical of main menu
-        img = _make_image(10, 15, 12)
+        # Near-black main menu background
+        img = _make_image(10, 12, 10)
         assert self.reader._detect_game_active(img) is False
 
-    def test_bright_non_green_returns_false(self):
-        # Very bright but no green dominance (e.g. white UI)
-        img = _make_image(220, 200, 210)
-        assert self.reader._detect_game_active(img) is False
+    def test_borderline_at_threshold_returns_true(self):
+        # Mean brightness exactly equal to threshold should pass
+        v = BOARD_MIN_MEAN_BRIGHTNESS
+        img = _make_image(v, v, v)
+        assert self.reader._detect_game_active(img) is True
 
-    def test_borderline_green_below_threshold_returns_false(self):
-        # Green channel just below BOARD_MIN_GREEN
-        img = _make_image(30, BOARD_MIN_GREEN - 1, 25)
+    def test_one_below_threshold_returns_false(self):
+        v = BOARD_MIN_MEAN_BRIGHTNESS - 1
+        img = _make_image(v, v, v)
         assert self.reader._detect_game_active(img) is False
 
 
@@ -200,7 +214,8 @@ class TestReadGameStateGameActiveGate:
 
     def test_window_found_board_active_returns_true(self):
         reader = self._make_reader()
-        board_img = _make_image(70, 110, 65)  # greenish board colour
+        # Use a brown board color (Stormwind theme) to verify theme-agnostic detection
+        board_img = _make_image(120, 90, 60)
 
         with patch.object(
             reader, "capture_game_window", return_value=(board_img, True)
