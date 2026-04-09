@@ -207,6 +207,10 @@ class ScreenReader:
         with mss.mss() as sct:
             if bbox is not None:
                 left, top, width, height = bbox
+                logger.debug(
+                    "Capturing game window: left=%d top=%d width=%d height=%d",
+                    left, top, width, height,
+                )
                 region = {
                     "left": left,
                     "top": top,
@@ -220,6 +224,10 @@ class ScreenReader:
                 return image, True
 
             # Fallback: full monitor capture
+            logger.debug(
+                "Hearthstone window not found – falling back to full monitor %d.",
+                self._monitor_index,
+            )
             monitor = sct.monitors[self._monitor_index]
             screenshot = sct.grab(monitor)
             image = Image.frombytes(
@@ -255,12 +263,16 @@ class ScreenReader:
         when the Hearthstone window cannot be found, so the agent loop can
         wait without performing any actions.
         """
+        logger.debug("read_game_state: capturing game window…")
         screen, window_found = self.capture_game_window()
         state = GameState()
 
         if not window_found:
             logger.debug("Hearthstone window not found.")
             return state  # game_active stays False
+
+        w, h = screen.size
+        logger.debug("Game window captured: %d × %d px.", w, h)
 
         if not self._detect_game_active(screen):
             logger.debug("Hearthstone window found but game board not detected.")
@@ -271,6 +283,13 @@ class ScreenReader:
         state.my_hero_health = self._read_hero_health(screen, enemy=False)
         state.enemy_hero_health = self._read_hero_health(screen, enemy=True)
 
+        logger.debug(
+            "Game active – mana=%d  my_hp=%d  enemy_hp=%d",
+            state.available_mana,
+            state.my_hero_health,
+            state.enemy_hero_health,
+        )
+
         hand_image = self.crop_region(screen, "hand")
         board_image = self.crop_region(screen, "board_player")
         enemy_image = self.crop_region(screen, "board_enemy")
@@ -279,9 +298,19 @@ class ScreenReader:
         state.board_minions = self._card_detector(board_image)
         state.enemy_minions = self._card_detector(enemy_image)
 
+        logger.debug(
+            "Detected cards – hand=%d  own_board=%d  enemy_board=%d",
+            len(state.hand_cards),
+            len(state.board_minions),
+            len(state.enemy_minions),
+        )
+
         state.game_over = self._detect_game_over(screen)
         if state.game_over:
             state.player_won = self._detect_winner(screen)
+            logger.debug(
+                "Game-over screen detected. player_won=%s", state.player_won
+            )
 
         return state
 
@@ -324,8 +353,15 @@ class ScreenReader:
             total_brightness += (r + g + b) / 3
 
         if n == 0:
+            logger.debug("_detect_game_active: no probe points could be sampled.")
             return False
         mean_brightness = total_brightness / n
+        logger.debug(
+            "_detect_game_active: mean_brightness=%.1f  threshold=%d  active=%s",
+            mean_brightness,
+            BOARD_MIN_MEAN_BRIGHTNESS,
+            mean_brightness >= BOARD_MIN_MEAN_BRIGHTNESS,
+        )
         return mean_brightness >= BOARD_MIN_MEAN_BRIGHTNESS
 
     def _read_mana(self, screen: "Image.Image") -> int:

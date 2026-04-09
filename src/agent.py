@@ -50,6 +50,11 @@ class HearthstoneAgent:
         self._poll_interval = poll_interval
         self._screen_reader = screen_reader  # injected or created lazily
         self._played_this_game: List[str] = []
+        logger.debug(
+            "HearthstoneAgent initialised – value_store=%s  poll_interval=%.1fs",
+            value_store_path,
+            poll_interval,
+        )
 
     # ------------------------------------------------------------------ #
     # Screen reader (lazy init so we don't require mss at import time)    #
@@ -82,6 +87,17 @@ class HearthstoneAgent:
         the mouse/keyboard events to the game window.  Here it logs the
         intended actions so that the framework can be tested headlessly.
         """
+        logger.info(
+            "Turn start – mana=%d  hand=%d  own_board=%d  enemy_board=%d  "
+            "my_hp=%d  enemy_hp=%d",
+            state.available_mana,
+            len(state.hand_cards),
+            len(state.board_minions),
+            len(state.enemy_minions),
+            state.my_hero_health,
+            state.enemy_hero_health,
+        )
+
         hand = self.enrich_cards_with_values(
             [Card(**c) for c in state.hand_cards]
         )
@@ -99,6 +115,8 @@ class HearthstoneAgent:
             enemy_minions=enemy_minions,
             enemy_hero_health=state.enemy_hero_health,
         )
+
+        logger.info("Planning complete – %d action(s) to execute.", len(actions))
 
         for action in actions:
             if action["type"] == "play":
@@ -164,6 +182,7 @@ class HearthstoneAgent:
         try:
             while True:
                 try:
+                    logger.debug("Polling screen…")
                     state = self.screen_reader.read_game_state()
 
                     if not state.game_active:
@@ -174,6 +193,8 @@ class HearthstoneAgent:
                             )
                             _was_waiting = True
                     else:
+                        if _was_waiting:
+                            logger.info("Match detected – resuming game actions.")
                         _was_waiting = False
                         if state.game_over:
                             if state.player_won is not None:

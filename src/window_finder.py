@@ -62,7 +62,12 @@ def _find_window_win32() -> Optional[Tuple[int, int, int, int]]:
         wins = gw.getWindowsWithTitle(HEARTHSTONE_WINDOW_TITLE)
         if wins:
             win = wins[0]
-            return (win.left, win.top, win.width, win.height)
+            bbox = (win.left, win.top, win.width, win.height)
+            logger.debug(
+                "Window found via pygetwindow: left=%d top=%d width=%d height=%d",
+                *bbox,
+            )
+            return bbox
     except Exception as exc:
         logger.debug("pygetwindow lookup failed: %s", exc)
 
@@ -74,7 +79,12 @@ def _find_window_win32() -> Optional[Tuple[int, int, int, int]]:
         if hwnd:
             rect = win32gui.GetWindowRect(hwnd)
             left, top, right, bottom = rect
-            return (left, top, right - left, bottom - top)
+            bbox = (left, top, right - left, bottom - top)
+            logger.debug(
+                "Window found via win32gui: left=%d top=%d width=%d height=%d",
+                *bbox,
+            )
+            return bbox
     except Exception as exc:
         logger.debug("win32gui lookup failed: %s", exc)
 
@@ -106,12 +116,17 @@ def _find_window_linux() -> Optional[Tuple[int, int, int, int]]:
                 key, val = line.split("=", 1)
                 params[key.strip()] = val.strip()
 
-        return (
+        bbox = (
             int(params.get("X", 0)),
             int(params.get("Y", 0)),
             int(params.get("WIDTH", DEFAULT_GAME_WIDTH)),
             int(params.get("HEIGHT", DEFAULT_GAME_HEIGHT)),
         )
+        logger.debug(
+            "Window found via xdotool: left=%d top=%d width=%d height=%d",
+            *bbox,
+        )
+        return bbox
     except FileNotFoundError:
         logger.debug("xdotool not found – install with: apt install xdotool")
     except Exception as exc:
@@ -131,12 +146,17 @@ def _find_window_macos() -> Optional[Tuple[int, int, int, int]]:
         for win in window_list:
             if HEARTHSTONE_WINDOW_TITLE in (win.get("kCGWindowName") or ""):
                 bounds = win["kCGWindowBounds"]
-                return (
+                bbox = (
                     int(bounds["X"]),
                     int(bounds["Y"]),
                     int(bounds["Width"]),
                     int(bounds["Height"]),
                 )
+                logger.debug(
+                    "Window found via Quartz: left=%d top=%d width=%d height=%d",
+                    *bbox,
+                )
+                return bbox
     except Exception as exc:
         logger.debug("Quartz lookup failed: %s", exc)
 
