@@ -1,0 +1,26 @@
+# Core dependencies for the Hearthstone automated player agent
+# Screen capture & image processing (required for live play)
+mss>=9.0.1
+Pillow>=10.0.0
+
+# Primary screen capture – DPI-aware, no system package required
+# Falls back to mss when unavailable.
+pyautogui>=0.9.54
+
+# Board detection via template matching (replaces fragile brightness probe)
+# Falls back to brightness probe when unavailable.
+opencv-python>=4.8.0
+
+# Window detection – finds the Hearthstone window in windowed mode
+# Windows: pygetwindow (primary) + win32gui (fallback, via pywin32)
+# Linux:   python-xlib (pure Python, no system package needed)
+# macOS:   Quartz framework (built-in)
+pygetwindow>=0.0.9
+python-xlib>=0.33
+
+# Cross-platform mouse tracking – used by CardInspector for hover detection
+pynput>=1.7.7
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
