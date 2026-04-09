@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 HEARTHSTONE_WINDOW_TITLE = "Hearthstone"
 
 # Default game resolution for windowed mode (used as fallback dimensions)
-DEFAULT_GAME_WIDTH = 1920
+DEFAULT_GAME_WIDTH = 1440
 DEFAULT_GAME_HEIGHT = 1080
 
 

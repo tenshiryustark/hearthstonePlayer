@@ -5,7 +5,7 @@ It uses ``mss`` for fast multi-platform screenshot capture and ``Pillow``
 for image processing.  Actual card/UI recognition (OCR, template matching,
 or a neural model) is plugged in via the ``_detect_*`` helper stubs.
 
-Window-aware capture (1920 × 1080 windowed mode)
+Window-aware capture (1440 × 1080 windowed mode)
 -------------------------------------------------
 The reader first tries to locate the Hearthstone window via
 :mod:`src.window_finder`.  When found, it captures only the game window
@@ -90,9 +90,9 @@ class GameState:
 # ---------------------------------------------------------------------------
 # Screen region definitions (fractions of the *game window* width/height)
 #
-# These fractions are calibrated against a 1920 × 1080 Hearthstone window.
+# These fractions are calibrated against a 1440 × 1080 Hearthstone window.
 # Because the reader crops to the game window first, they remain valid even
-# when the desktop resolution differs from 1920 × 1080.
+# when the desktop resolution differs from 1440 × 1080.
 # ---------------------------------------------------------------------------
 
 REGIONS = {

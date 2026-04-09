@@ -7,6 +7,9 @@ Pillow>=10.0.0
 # (Windows: also ships win32gui via pywin32; Linux: needs xdotool system package)
 pygetwindow>=0.0.9
 
+# Cross-platform mouse tracking – used by CardInspector for hover detection
+pynput>=1.7.7
+
 # Testing
 pytest>=7.4.0
 pytest-cov>=4.1.0
